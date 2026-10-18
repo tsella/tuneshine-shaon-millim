@@ -1,0 +1,20 @@
+# tuneshine-shaon-millim, once a minute.
+#
+# Install with:  crontab -e   and paste the line below.
+# Cron does not read your shell profile, so use absolute paths everywhere.
+# The clock needs no output: log to a file if you want a record, or send stderr
+# to /dev/null as below.
+#
+# Change the two paths to where you put the project and its config.
+
+* * * * * /usr/bin/python3 /opt/tuneshine-shaon-millim/shaon_millim.py --push --config /home/USER/.config/tuneshine-shaon-millim/config.json >/dev/null 2>&1
+
+# A minute is the right interval. The phrase only changes when the minute
+# changes, so anything faster is wasted uploads, and anything slower leaves the
+# display showing a stale time.
+#
+# If your python comes from a virtualenv, point at that interpreter instead,
+# for example /opt/tuneshine-shaon-millim/.venv/bin/python3.
+#
+# To run it as a service instead of from cron, a systemd timer works too. The
+# command is the same; use OnCalendar=*-*-* *:*:00 and Type=oneshot.

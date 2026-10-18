@@ -1,0 +1,29 @@
+{
+  "devices": [
+    "192.168.1.19"
+  ],
+  "label": "Hebrew word clock",
+  "timezone": "local",
+  "respect_playback": true,
+  "colors": {
+    "preset": "oled-warm",
+    "background": null,
+    "letter": null,
+    "nikkud": null,
+    "period": null,
+    "period_luminance": true
+  },
+  "render": {
+    "sizing": "fit",
+    "size": null,
+    "line_height": null,
+    "line_gap": 2,
+    "nikkud": "color",
+    "align": "right",
+    "antialias": true
+  },
+  "fonts": {
+    "path": null,
+    "weight": null
+  }
+}
