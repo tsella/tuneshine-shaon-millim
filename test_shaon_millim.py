@@ -9,7 +9,9 @@ No network and no panel needed. Every test renders in-process.
 import contextlib
 import importlib.util
 import io
+import json
 import os
+import tempfile
 import socket
 import struct
 import sys
@@ -244,8 +246,7 @@ class TestDiscovery(Base):
 
     @staticmethod
     def _rr(name, rtype, rdata, ttl=120):
-        encoded = sm._encode_name(name)
-        return (encoded
+        return (sm._encode_name(name)
                 + struct.pack(">HHIH", rtype, 1, ttl, len(rdata))
                 + rdata)
 
@@ -257,18 +258,23 @@ class TestDiscovery(Base):
             out += bytes([len(chunk)]) + chunk
         return out
 
+    @classmethod
+    def _answer(cls, *records):
+        """A response header claiming `records` as its answers."""
+        return (struct.pack(">HHHHHH", 0, 0x8400, 0, len(records), 0, 0)
+                + b"".join(records))
+
+    INSTANCE = "Tuneshine 89B8._tuneshine._tcp.local"
+    HOST = "tuneshine-89B8.local"
+
     def _packet(self):
-        instance = "Tuneshine 89B8._tuneshine._tcp.local"
-        host = "tuneshine-89B8.local"
-        records = [
-            self._rr("_tuneshine._tcp.local", 12, sm._encode_name(instance)),
-            self._rr(instance, 33,
-                     struct.pack(">HHH", 0, 0, 80) + sm._encode_name(host)),
-            self._rr(instance, 16, self._txt("deviceId=abc-123", "version=2.7.5")),
-            self._rr(host, 1, bytes([192, 168, 1, 19])),
-        ]
-        header = struct.pack(">HHHHHH", 0, 0x8400, 0, len(records), 0, 0)
-        return header + b"".join(records)
+        return self._answer(
+            self._rr("_tuneshine._tcp.local", 12, sm._encode_name(self.INSTANCE)),
+            self._rr(self.INSTANCE, 33,
+                     struct.pack(">HHH", 0, 0, 80) + sm._encode_name(self.HOST)),
+            self._rr(self.INSTANCE, 16, self._txt("deviceId=abc-123", "version=2.7.5")),
+            self._rr(self.HOST, 1, bytes([192, 168, 1, 19])),
+        )
 
     def test_a_well_formed_answer_parses(self):
         records = sm._parse_records(self._packet())
@@ -277,10 +283,9 @@ class TestDiscovery(Base):
             by_type.setdefault(record["type"], []).append(record)
 
         self.assertEqual(len(by_type["PTR"]), 1)
-        self.assertEqual(by_type["PTR"][0]["value"],
-                         "Tuneshine 89B8._tuneshine._tcp.local")
+        self.assertEqual(by_type["PTR"][0]["value"], self.INSTANCE)
         self.assertEqual(by_type["SRV"][0]["port"], 80)
-        self.assertEqual(by_type["SRV"][0]["target"], "tuneshine-89B8.local")
+        self.assertEqual(by_type["SRV"][0]["target"], self.HOST)
         self.assertEqual(by_type["A"][0]["value"], "192.168.1.19")
 
     def test_txt_keys_are_read_from_length_prefixed_strings(self):
@@ -297,6 +302,13 @@ class TestDiscovery(Base):
         name, _off = sm._parse_name(packet, 12)
         self.assertEqual(name, "")
 
+    def test_a_reserved_label_type_ends_the_name(self):
+        # 0x40 is a reserved label type. Read as a length it consumes 64 bytes of
+        # whatever follows and returns garbage as a label.
+        packet = struct.pack(">HHHHHH", 0, 0x8400, 0, 0, 0, 0) + b"\x40" + b"A" * 20
+        name, _off = sm._parse_name(packet, 12)
+        self.assertEqual(name, "")
+
     def test_a_truncated_packet_does_not_raise(self):
         for cut in range(len(self._packet())):
             sm._parse_records(self._packet()[:cut])
@@ -307,42 +319,163 @@ class TestDiscovery(Base):
 
     def test_an_instance_without_an_a_record_is_dropped(self):
         # PTR and SRV present, no A: there is no address to push to.
-        instance = "Tuneshine 89B8._tuneshine._tcp.local"
-        records = [
-            self._rr("_tuneshine._tcp.local", 12, sm._encode_name(instance)),
-            self._rr(instance, 33,
+        answer = self._answer(
+            self._rr("_tuneshine._tcp.local", 12, sm._encode_name(self.INSTANCE)),
+            self._rr(self.INSTANCE, 33,
                      struct.pack(">HHH", 0, 0, 80) + sm._encode_name("nowhere.local")),
-        ]
-        header = struct.pack(">HHHHHH", 0, 0x8400, 0, len(records), 0, 0)
-        original = sm._mdns_socket
+        )
 
         class FakeSock:
-            def sendto(self, *a):
-                return None
-
-            def settimeout(self, *a):
-                return None
-
-            def recvfrom(self, *a):
-                raise socket.timeout()
-
             def close(self):
                 return None
 
+        originals = (sm._mdns_socket, sm._mdns_query)
+        sm._mdns_socket = lambda: FakeSock()
+        sm._mdns_query = lambda sock, names, qtype, wait, stop_on=None: sm._parse_records(answer)
         try:
-            sm._mdns_socket = lambda: FakeSock()
-            sm._mdns_query = lambda sock, name, qtype, wait: sm._parse_records(
-                header + b"".join(records))
             self.assertEqual(sm.discover_mdns(0.01), [])
         finally:
-            sm._mdns_socket = original
+            sm._mdns_socket, sm._mdns_query = originals
+
+    def test_the_a_record_follow_up_asks_for_every_missing_host_at_once(self):
+        instance = self.INSTANCE
+        answer = self._answer(
+            self._rr("_tuneshine._tcp.local", 12, sm._encode_name(instance)),
+            self._rr(instance, 33,
+                     struct.pack(">HHH", 0, 0, 80) + sm._encode_name("late.local")),
+        )
+        calls = []
+
+        class FakeSock:
+            def close(self):
+                return None
+
+        def fake_query(sock, names, qtype, wait, stop_on=None):
+            calls.append((list(names), qtype, round(wait, 3), stop_on))
+            if qtype == 12:
+                return sm._parse_records(answer)
+            return [{"name": "late.local", "type": "A", "value": "10.0.0.9"}]
+
+        originals = (sm._mdns_socket, sm._mdns_query)
+        sm._mdns_socket = lambda: FakeSock()
+        sm._mdns_query = fake_query
+        try:
+            found = sm.discover_mdns(4.0)
+        finally:
+            sm._mdns_socket, sm._mdns_query = originals
+
+        self.assertEqual(found[0]["host"], "10.0.0.9")
+        # One browse, then ONE follow-up round carrying every missing name, on a
+        # budget of its own rather than the full browse timeout.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0], ["late.local"])
+        self.assertEqual(calls[1][2], sm.MDNS_FOLLOWUP_WAIT)
+        self.assertEqual(calls[1][3], "A")
 
 
-class TestPushUsesDiscovery(Base):
-    def _run(self, found):
+class TestMdnsTimeout(Base):
+    def test_a_number_is_used(self):
+        self.assertEqual(sm.mdns_timeout(1.5), 1.5)
+        self.assertEqual(sm.mdns_timeout("2"), 2.0)
+
+    def test_nothing_configured_uses_the_default(self):
+        self.assertEqual(sm.mdns_timeout(None), sm.MDNS_TIMEOUT)
+        self.assertEqual(sm.mdns_timeout(""), sm.MDNS_TIMEOUT)
+
+    def test_junk_warns_and_falls_back(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(sm.mdns_timeout("soon"), sm.MDNS_TIMEOUT)
+        self.assertIn("not a number", err.getvalue())
+
+    def test_zero_and_negative_fall_back(self):
+        self.assertEqual(sm.mdns_timeout(0), sm.MDNS_TIMEOUT)
+        self.assertEqual(sm.mdns_timeout(-3), sm.MDNS_TIMEOUT)
+
+
+class TestDiscoverCli(Base):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="shaon-cli-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def _main(self, argv, found):
         seen = {}
 
         def fake_discover(wait=sm.MDNS_TIMEOUT):
+            seen["wait"] = wait
+            return found
+
+        original, saved_argv = sm.discover_mdns, sys.argv
+        sm.discover_mdns = fake_discover
+        sys.argv = ["shaon_millim.py"] + argv
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = sm.main()
+        finally:
+            sm.discover_mdns, sys.argv = original, saved_argv
+        return code, out.getvalue(), seen
+
+    def test_a_panel_found_exits_zero(self):
+        code, out, _ = self._main(["--discover"], [
+            {"name": "Tuneshine 89B8", "host": "192.168.1.19",
+             "txt": {"version": "2.7.5"}}])
+        self.assertEqual(code, 0)
+        self.assertIn("192.168.1.19", out)
+        self.assertIn("version=2.7.5", out)
+
+    def test_finding_nothing_exits_one(self):
+        # A wrapper script has to be able to tell a working network from a
+        # blocked one.
+        code, out, _ = self._main(["--discover"], [])
+        self.assertEqual(code, 1)
+        self.assertIn("no Tuneshine found", out)
+
+    def test_discover_honours_mdns_timeout_from_the_config(self):
+        path = os.path.join(self.tmp, "fast.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"mdns_timeout": 1.5}, fh)
+        code, _out, seen = self._main(["--discover", "--config", path], [])
+        self.assertEqual(code, 1)
+        self.assertEqual(seen["wait"], 1.5)
+
+
+class TestExampleConfig(Base):
+    """config.example.json is a copy of the defaults, so it drifts silently.
+    These tests make drift a failure instead of a surprise."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(HERE, "config.example.json"), encoding="utf-8") as fh:
+            cls.cfg = json.load(fh)
+
+    def test_mdns_timeout_matches_the_constant(self):
+        self.assertEqual(self.cfg["mdns_timeout"], sm.MDNS_TIMEOUT)
+
+    def test_render_defaults_match_the_code(self):
+        for key, expected in sm.RENDER_DEFAULTS.items():
+            self.assertEqual(self.cfg["render"].get(key), expected, key)
+
+    def test_colour_defaults_match_the_code(self):
+        for key, expected in sm.DEFAULT_COLORS.items():
+            self.assertEqual(self.cfg["colors"].get(key), expected, key)
+
+    def test_the_example_has_every_documented_key(self):
+        expected = {"devices", "mdns_timeout", "label", "timezone", "respect_playback",
+                    "colors", "render", "fonts"}
+        self.assertEqual(set(self.cfg), expected)
+
+    def test_the_example_is_valid_for_the_renderer(self):
+        img, info = sm.render(9, 41, {"colors": self.cfg["colors"],
+                                      "render": self.cfg["render"]})
+        self.assertTrue(info["fits"])
+
+
+class TestPushUsesDiscovery(Base):
+    def _run(self, found, config=None):
+        seen = {}
+
+        def fake_discover(wait=sm.MDNS_TIMEOUT):
+            seen["discovered"] = True
             seen["wait"] = wait
             return found
 
@@ -354,23 +487,22 @@ class TestPushUsesDiscovery(Base):
         sm.discover_mdns, sm.upload_frame = fake_discover, fake_upload
         try:
             img = Image.new("RGB", (64, 64), (0, 0, 0))
-            quiet = (contextlib.redirect_stdout(io.StringIO()),
-                     contextlib.redirect_stderr(io.StringIO()))
-            with quiet[0], quiet[1]:
-                code = sm.push_to_devices({"respect_playback": False}, img, "x", "09:41")
+            cfg = {"respect_playback": False}
+            cfg.update(config or {})
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = sm.push_to_devices(cfg, img, "x", "09:41")
         finally:
             sm.discover_mdns, sm.upload_frame = originals
         return code, seen
 
     def test_an_empty_device_list_discovers_and_pushes(self):
-        code, seen = self._run([{"host": "10.0.0.5", "ip": "10.0.0.5",
-                                 "port": 80, "name": "x", "txt": {}}])
+        code, seen = self._run([{"name": "x", "host": "10.0.0.5", "txt": {}}])
         self.assertEqual(code, 0)
         self.assertEqual(seen["uploads"], ["10.0.0.5"])
 
     def test_a_non_default_port_is_kept(self):
-        code, seen = self._run([{"host": "10.0.0.5:8080", "ip": "10.0.0.5",
-                                 "port": 8080, "name": "x", "txt": {}}])
+        code, seen = self._run([{"name": "x", "host": "10.0.0.5:8080", "txt": {}}])
         self.assertEqual(code, 0)
         self.assertEqual(seen["uploads"], ["10.0.0.5:8080"])
 
@@ -380,28 +512,15 @@ class TestPushUsesDiscovery(Base):
         self.assertNotIn("uploads", seen)
 
     def test_a_configured_device_skips_discovery(self):
-        seen = {}
-
-        def fake_upload(host, payload, phrase, hhmm, label="", timeout=0):
-            seen["uploads"] = [host]
-            return "ok"
-
-        def explosion(wait=0):
-            raise AssertionError("discovery must not run when a device is configured")
-
-        originals = (sm.discover_mdns, sm.upload_frame)
-        sm.discover_mdns, sm.upload_frame = explosion, fake_upload
-        try:
-            img = Image.new("RGB", (64, 64), (0, 0, 0))
-            quiet = (contextlib.redirect_stdout(io.StringIO()),
-                     contextlib.redirect_stderr(io.StringIO()))
-            with quiet[0], quiet[1]:
-                code = sm.push_to_devices({"devices": ["192.168.1.19"],
-                                           "respect_playback": False}, img, "x", "09:41")
-        finally:
-            sm.discover_mdns, sm.upload_frame = originals
+        code, seen = self._run([], {"devices": ["192.168.1.19"]})
         self.assertEqual(code, 0)
         self.assertEqual(seen["uploads"], ["192.168.1.19"])
+        self.assertNotIn("discovered", seen)
+
+    def test_the_configured_mdns_timeout_is_used(self):
+        _code, seen = self._run([{"name": "x", "host": "10.0.0.5", "txt": {}}],
+                                {"mdns_timeout": 2.5})
+        self.assertEqual(seen["wait"], 2.5)
 
 
 if __name__ == "__main__":

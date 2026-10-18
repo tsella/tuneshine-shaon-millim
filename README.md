@@ -58,21 +58,16 @@ pip install pillow
 Nothing else to build. The font is bundled, so the clock works from a fresh
 clone.
 
-Copy the example config and edit the device address:
+Copy the example config:
 
 ```sh
 mkdir -p ~/.config/tuneshine-shaon-millim
 cp config.example.json ~/.config/tuneshine-shaon-millim/config.json
 ```
 
-Then find the panel:
-
-```sh
-python3 shaon_millim.py --discover
-```
-
-With no device in the config, `--push` runs discovery itself and uses whatever it
-finds, so the two commands above are usually all the setup there is.
+Its `devices` list is empty, so the clock finds the panel itself. See
+[Finding the panel](#finding-the-panel) for what that prints, and how to pin an
+address instead.
 
 ## Finding the panel
 
@@ -88,14 +83,17 @@ python3 shaon_millim.py --discover
 Tuneshine 89B8   192.168.1.19   apiVersion=1 deviceId=... deviceName=Tom Sella's Tuneshine version=2.7.5
 ```
 
+`--discover` exits 0 when it found a panel and 1 when it found none, so a script
+can tell a working network from a blocked one.
+
 Discovery runs on two paths:
 
 - `--discover` lists what it found and stops.
 - `--push` uses discovery when `devices` in the config is empty, which is the
-  default in `config.example.json`.
+  default in `config.example.json`. That costs the `mdns_timeout` wait on every
+  run, which matters for a once-a-minute cron job.
 
-To pin one panel and skip discovery entirely, put its address in `devices`. Any of
-these work:
+To skip discovery entirely, put the address in `devices`. Any of these work:
 
 - the IP, for example `192.168.1.19`
 - the mDNS name, for example `tuneshine-89B8.local`
@@ -105,9 +103,9 @@ these work:
 "devices": ["192.168.1.19"]
 ```
 
-A pinned address costs one second less per run, and keeps working on a network
-that blocks multicast. Discovery costs the timeout, four seconds by default, and
-finds every panel, which is what you want if you have more than one.
+A pinned address removes the whole discovery wait from every run, and keeps
+working on a network that blocks multicast. Discovery finds every panel, which is
+what you want if you have more than one.
 
 If discovery finds nothing, check that the machine running cron can receive
 multicast. Containers on a bridge network usually cannot, and some Wi-Fi

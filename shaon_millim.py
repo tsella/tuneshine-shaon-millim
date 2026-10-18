@@ -612,19 +612,20 @@ def simulate_panel(frame: Image.Image, scale: int = 8, glow: bool = True,
 MDNS_SERVICE = "_tuneshine._tcp.local"
 MDNS_GROUP = "224.0.0.251"
 MDNS_PORT = 5353
-MDNS_TIMEOUT = 4.0
+MDNS_TIMEOUT = 4.0            # seconds to listen for panels
+MDNS_POLL_INTERVAL = 0.4      # socket timeout between reads
+MDNS_FOLLOWUP_WAIT = 2.0      # shared budget for the A-record follow-up
 MAX_POINTER_JUMPS = 20
 
 
 def _encode_name(name: str) -> bytes:
-    out = b""
-    for label in name.strip(".").split("."):
-        raw = label.encode()
-        out += bytes([len(raw)]) + raw
-    return out + b"\x00"
+    """Encode a dotted name as DNS labels."""
+    parts = [bytes([len(raw)]) + raw
+             for raw in (label.encode() for label in name.strip(".").split("."))]
+    return b"".join(parts) + b"\x00"
 
 
-def _parse_name(data: bytes, off: int):
+def _parse_name(data: bytes, off: int) -> Tuple[str, int]:
     """Read a possibly compressed DNS name. Returns (name, next_offset)."""
     labels: List[str] = []
     start = off
@@ -653,6 +654,10 @@ def _parse_name(data: bytes, off: int):
             off = pointer
             jumped = True
             continue
+        if length & 0xC0:
+            # 0x40 and 0x80 are reserved label types, not lengths. Reading one as a
+            # length consumes the rest of the packet as garbage labels.
+            return ".".join(labels), start
         off += 1
         labels.append(data[off:off + length].decode("utf-8", "replace"))
         off += length
@@ -712,45 +717,79 @@ def _parse_records(data: bytes) -> List[Dict[str, Any]]:
 
 
 def _mdns_socket():
+    """Open a socket joined to the mDNS group. Closes it if setup fails."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except (AttributeError, OSError):
-        pass
-    sock.bind(("", MDNS_PORT))
-    membership = struct.pack("=4sl", socket.inet_aton(MDNS_GROUP), socket.INADDR_ANY)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        sock.bind(("", MDNS_PORT))
+        membership = struct.pack("=4sl", socket.inet_aton(MDNS_GROUP), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    except OSError:
+        sock.close()
+        raise
     return sock
 
 
-def _mdns_query(sock, name: str, qtype: int, wait: float) -> List[Dict[str, Any]]:
+def _mdns_query(sock, names: List[str], qtype: int, wait: float,
+                stop_on: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Ask for every name at once and collect answers for up to `wait` seconds.
+
+    `stop_on` is a record type. When given, the read stops as soon as every asked
+    name has an answer of that type, so a follow-up question does not sit out the
+    whole window after the answer is already in hand. A browse passes None: the
+    number of panels is unknown, so there is no point at which the answer is
+    provably complete and the full window is the only correct wait.
+    """
     header = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
-    packet = header + _encode_name(name) + struct.pack(">HH", qtype, 1)
-    sock.sendto(packet, (MDNS_GROUP, MDNS_PORT))
-    sock.settimeout(0.4)
-    deadline = time.time() + wait
+    for name in names:
+        sock.sendto(header + _encode_name(name) + struct.pack(">HH", qtype, 1),
+                    (MDNS_GROUP, MDNS_PORT))
+    sock.settimeout(MDNS_POLL_INTERVAL)
+    deadline = time.monotonic() + wait
+    outstanding = set(names)
     records: List[Dict[str, Any]] = []
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
             data, _addr = sock.recvfrom(9000)
         except socket.timeout:
             continue
         except OSError:
             break
-        records.extend(_parse_records(data))
+        answers = _parse_records(data)
+        records.extend(answers)
+        if stop_on:
+            outstanding -= {r["name"] for r in answers if r["type"] == stop_on}
+            if not outstanding:
+                break
     return records
+
+
+def mdns_timeout(value: Any) -> float:
+    """Coerce a configured timeout. Bad input warns and falls back."""
+    if value is None or value == "":
+        return MDNS_TIMEOUT
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        print("mdns_timeout %r is not a number; using %s"
+              % (value, MDNS_TIMEOUT), file=sys.stderr)
+        return MDNS_TIMEOUT
+    return seconds if seconds > 0 else MDNS_TIMEOUT
 
 
 def discover_mdns(wait: float = MDNS_TIMEOUT) -> List[Dict[str, Any]]:
     """Find every Tuneshine on the LAN.
 
-    Returns dicts with name, host (IP or IP:port), ip, port and txt. Returns an
-    empty list when mDNS is unavailable, which is not an error: callers fall back
-    to a configured address.
+    Returns dicts with name, host and txt, where host is the IP, or ip:port when
+    the panel is not on port 80. Returns an empty list when mDNS is unavailable,
+    which is not an error: callers fall back to a configured address.
     """
-    instances: Dict[str, bool] = {}
+    instances: set = set()
     srv: Dict[str, Tuple[str, int]] = {}
     addrs: Dict[str, str] = {}
     txt: Dict[str, Dict[str, str]] = {}
@@ -762,9 +801,9 @@ def discover_mdns(wait: float = MDNS_TIMEOUT) -> List[Dict[str, Any]]:
         return []
 
     try:
-        for record in _mdns_query(sock, MDNS_SERVICE, 12, wait):
+        for record in _mdns_query(sock, [MDNS_SERVICE], 12, wait):
             if record["type"] == "PTR" and record["value"].endswith(MDNS_SERVICE):
-                instances[record["value"]] = True
+                instances.add(record["value"])
             elif record["type"] == "SRV":
                 srv[record["name"]] = (record["target"], record["port"])
             elif record["type"] == "TXT":
@@ -772,13 +811,15 @@ def discover_mdns(wait: float = MDNS_TIMEOUT) -> List[Dict[str, Any]]:
             elif record["type"] == "A":
                 addrs[record["name"]] = record["value"]
 
-        # An instance whose A record did not arrive gets one follow-up query.
-        for instance in list(instances):
-            target, _port = srv.get(instance, (None, 0))
-            if target and target not in addrs:
-                for record in _mdns_query(sock, target, 1, 2.0):
-                    if record["type"] == "A":
-                        addrs[record["name"]] = record["value"]
+        # An instance whose A record did not arrive gets one shared follow-up
+        # round: every unresolved host is asked in the same pass, on one budget,
+        # so N panels cost at most MDNS_FOLLOWUP_WAIT rather than N times it.
+        missing = sorted({srv[i][0] for i in instances if i in srv} - set(addrs))
+        if missing:
+            budget = min(wait, MDNS_FOLLOWUP_WAIT)
+            for record in _mdns_query(sock, missing, 1, budget, stop_on="A"):
+                if record["type"] == "A":
+                    addrs[record["name"]] = record["value"]
     except OSError as exc:
         print("mDNS query failed: %s" % exc, file=sys.stderr)
     finally:
@@ -796,8 +837,6 @@ def discover_mdns(wait: float = MDNS_TIMEOUT) -> List[Dict[str, Any]]:
         port = port or 80
         found.append({
             "name": instance.rsplit("." + MDNS_SERVICE, 1)[0],
-            "ip": ip,
-            "port": port,
             "host": ip if port == 80 else "%s:%d" % (ip, port),
             "txt": txt.get(instance, {}),
         })
@@ -805,6 +844,7 @@ def discover_mdns(wait: float = MDNS_TIMEOUT) -> List[Dict[str, Any]]:
 
 
 def print_devices(found: List[Dict[str, Any]]) -> None:
+    """Print one line per discovered panel."""
     if not found:
         print("no Tuneshine found on this network")
         return
@@ -881,7 +921,7 @@ def push_to_devices(config: Dict[str, Any], img: Image.Image, phrase: str,
         # No address given, so ask the network. This is the path a fresh install
         # takes: copy the example config, run --push, and it finds the panel.
         print("no device configured, looking on the network")
-        wait = float(config.get("mdns_timeout") or MDNS_TIMEOUT)
+        wait = mdns_timeout(config.get("mdns_timeout"))
         devices = [d["host"] for d in discover_mdns(wait)]
         if devices:
             print("  found %s" % ", ".join(devices))
@@ -999,18 +1039,20 @@ def main() -> int:
                     help="panel host for --push; repeatable, overrides the config list")
     args = ap.parse_args()
 
-    if args.discover:
-        print_devices(discover_mdns())
-        return 0
-
-    if args.swatches:
-        _swatches(args.swatches)
-        return 0
-
+    # Loaded first: --discover honours mdns_timeout, so it needs the config too.
     file_cfg: Dict[str, Any] = {}
     if args.config:
         with open(args.config, encoding="utf-8") as fh:
             file_cfg = json.load(fh)
+
+    if args.discover:
+        found = discover_mdns(mdns_timeout(file_cfg.get("mdns_timeout")))
+        print_devices(found)
+        return 0 if found else 1
+
+    if args.swatches:
+        _swatches(args.swatches)
+        return 0
 
     config: Dict[str, Any] = {
         "colors": {
