@@ -6,8 +6,12 @@
 No network and no panel needed. Every test renders in-process.
 """
 
+import contextlib
 import importlib.util
+import io
 import os
+import socket
+import struct
 import sys
 import unittest
 
@@ -232,6 +236,172 @@ class TestFont(Base):
             self.assertEqual(sm.FONT_PATH, original)
         finally:
             sm.set_font(original)
+
+
+class TestDiscovery(Base):
+    """The DNS parser reads packets from other machines, so it has to survive
+    malformed input as well as parse a good one."""
+
+    @staticmethod
+    def _rr(name, rtype, rdata, ttl=120):
+        encoded = sm._encode_name(name)
+        return (encoded
+                + struct.pack(">HHIH", rtype, 1, ttl, len(rdata))
+                + rdata)
+
+    @staticmethod
+    def _txt(*pairs):
+        out = b""
+        for pair in pairs:
+            chunk = pair.encode()
+            out += bytes([len(chunk)]) + chunk
+        return out
+
+    def _packet(self):
+        instance = "Tuneshine 89B8._tuneshine._tcp.local"
+        host = "tuneshine-89B8.local"
+        records = [
+            self._rr("_tuneshine._tcp.local", 12, sm._encode_name(instance)),
+            self._rr(instance, 33,
+                     struct.pack(">HHH", 0, 0, 80) + sm._encode_name(host)),
+            self._rr(instance, 16, self._txt("deviceId=abc-123", "version=2.7.5")),
+            self._rr(host, 1, bytes([192, 168, 1, 19])),
+        ]
+        header = struct.pack(">HHHHHH", 0, 0x8400, 0, len(records), 0, 0)
+        return header + b"".join(records)
+
+    def test_a_well_formed_answer_parses(self):
+        records = sm._parse_records(self._packet())
+        by_type = {}
+        for record in records:
+            by_type.setdefault(record["type"], []).append(record)
+
+        self.assertEqual(len(by_type["PTR"]), 1)
+        self.assertEqual(by_type["PTR"][0]["value"],
+                         "Tuneshine 89B8._tuneshine._tcp.local")
+        self.assertEqual(by_type["SRV"][0]["port"], 80)
+        self.assertEqual(by_type["SRV"][0]["target"], "tuneshine-89B8.local")
+        self.assertEqual(by_type["A"][0]["value"], "192.168.1.19")
+
+    def test_txt_keys_are_read_from_length_prefixed_strings(self):
+        # Splitting on null instead of the length byte loses every key.
+        records = sm._parse_records(self._packet())
+        txt = [r for r in records if r["type"] == "TXT"][0]["value"]
+        self.assertEqual(txt["deviceId"], "abc-123")
+        self.assertEqual(txt["version"], "2.7.5")
+
+    def test_a_self_pointing_compression_pointer_terminates(self):
+        # Byte 12 is a pointer back to byte 12. Without a jump bound this loops
+        # forever; the call returning at all is the assertion.
+        packet = struct.pack(">HHHHHH", 0, 0x8400, 0, 0, 0, 0) + b"\xc0\x0c"
+        name, _off = sm._parse_name(packet, 12)
+        self.assertEqual(name, "")
+
+    def test_a_truncated_packet_does_not_raise(self):
+        for cut in range(len(self._packet())):
+            sm._parse_records(self._packet()[:cut])
+
+    def test_a_short_packet_returns_nothing(self):
+        self.assertEqual(sm._parse_records(b""), [])
+        self.assertEqual(sm._parse_records(b"\x00" * 5), [])
+
+    def test_an_instance_without_an_a_record_is_dropped(self):
+        # PTR and SRV present, no A: there is no address to push to.
+        instance = "Tuneshine 89B8._tuneshine._tcp.local"
+        records = [
+            self._rr("_tuneshine._tcp.local", 12, sm._encode_name(instance)),
+            self._rr(instance, 33,
+                     struct.pack(">HHH", 0, 0, 80) + sm._encode_name("nowhere.local")),
+        ]
+        header = struct.pack(">HHHHHH", 0, 0x8400, 0, len(records), 0, 0)
+        original = sm._mdns_socket
+
+        class FakeSock:
+            def sendto(self, *a):
+                return None
+
+            def settimeout(self, *a):
+                return None
+
+            def recvfrom(self, *a):
+                raise socket.timeout()
+
+            def close(self):
+                return None
+
+        try:
+            sm._mdns_socket = lambda: FakeSock()
+            sm._mdns_query = lambda sock, name, qtype, wait: sm._parse_records(
+                header + b"".join(records))
+            self.assertEqual(sm.discover_mdns(0.01), [])
+        finally:
+            sm._mdns_socket = original
+
+
+class TestPushUsesDiscovery(Base):
+    def _run(self, found):
+        seen = {}
+
+        def fake_discover(wait=sm.MDNS_TIMEOUT):
+            seen["wait"] = wait
+            return found
+
+        def fake_upload(host, payload, phrase, hhmm, label="", timeout=0):
+            seen.setdefault("uploads", []).append(host)
+            return "ok"
+
+        originals = (sm.discover_mdns, sm.upload_frame)
+        sm.discover_mdns, sm.upload_frame = fake_discover, fake_upload
+        try:
+            img = Image.new("RGB", (64, 64), (0, 0, 0))
+            quiet = (contextlib.redirect_stdout(io.StringIO()),
+                     contextlib.redirect_stderr(io.StringIO()))
+            with quiet[0], quiet[1]:
+                code = sm.push_to_devices({"respect_playback": False}, img, "x", "09:41")
+        finally:
+            sm.discover_mdns, sm.upload_frame = originals
+        return code, seen
+
+    def test_an_empty_device_list_discovers_and_pushes(self):
+        code, seen = self._run([{"host": "10.0.0.5", "ip": "10.0.0.5",
+                                 "port": 80, "name": "x", "txt": {}}])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["uploads"], ["10.0.0.5"])
+
+    def test_a_non_default_port_is_kept(self):
+        code, seen = self._run([{"host": "10.0.0.5:8080", "ip": "10.0.0.5",
+                                 "port": 8080, "name": "x", "txt": {}}])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["uploads"], ["10.0.0.5:8080"])
+
+    def test_finding_nothing_fails_without_raising(self):
+        code, seen = self._run([])
+        self.assertEqual(code, 1)
+        self.assertNotIn("uploads", seen)
+
+    def test_a_configured_device_skips_discovery(self):
+        seen = {}
+
+        def fake_upload(host, payload, phrase, hhmm, label="", timeout=0):
+            seen["uploads"] = [host]
+            return "ok"
+
+        def explosion(wait=0):
+            raise AssertionError("discovery must not run when a device is configured")
+
+        originals = (sm.discover_mdns, sm.upload_frame)
+        sm.discover_mdns, sm.upload_frame = explosion, fake_upload
+        try:
+            img = Image.new("RGB", (64, 64), (0, 0, 0))
+            quiet = (contextlib.redirect_stdout(io.StringIO()),
+                     contextlib.redirect_stderr(io.StringIO()))
+            with quiet[0], quiet[1]:
+                code = sm.push_to_devices({"devices": ["192.168.1.19"],
+                                           "respect_playback": False}, img, "x", "09:41")
+        finally:
+            sm.discover_mdns, sm.upload_frame = originals
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["uploads"], ["192.168.1.19"])
 
 
 if __name__ == "__main__":

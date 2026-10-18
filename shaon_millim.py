@@ -23,7 +23,10 @@ import io
 import json
 import os
 import re
+import socket
+import struct
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -602,6 +605,216 @@ def simulate_panel(frame: Image.Image, scale: int = 8, glow: bool = True,
 
 
 # --------------------------------------------------------------------------
+# Finding panels on the network (mDNS, stdlib only)
+# --------------------------------------------------------------------------
+# A Tuneshine advertises _tuneshine._tcp.local over multicast DNS. Reading that
+# answer is enough to find every panel without anybody typing an address.
+MDNS_SERVICE = "_tuneshine._tcp.local"
+MDNS_GROUP = "224.0.0.251"
+MDNS_PORT = 5353
+MDNS_TIMEOUT = 4.0
+MAX_POINTER_JUMPS = 20
+
+
+def _encode_name(name: str) -> bytes:
+    out = b""
+    for label in name.strip(".").split("."):
+        raw = label.encode()
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+def _parse_name(data: bytes, off: int):
+    """Read a possibly compressed DNS name. Returns (name, next_offset)."""
+    labels: List[str] = []
+    start = off
+    jumped = False
+    jumps = 0
+    while True:
+        if off >= len(data):
+            return ".".join(labels), start
+        length = data[off]
+        if length == 0:
+            off += 1
+            if not jumped:
+                start = off
+            return ".".join(labels), start
+        if length & 0xC0 == 0xC0:
+            if off + 2 > len(data):
+                return ".".join(labels), start
+            pointer = struct.unpack(">H", data[off:off + 2])[0] & 0x3FFF
+            # A malformed packet can point a name at itself or chain pointers in a
+            # loop. Bound the jumps so this terminates instead of spinning forever.
+            jumps += 1
+            if jumps > MAX_POINTER_JUMPS:
+                return ".".join(labels), start
+            if not jumped:
+                start = off + 2
+            off = pointer
+            jumped = True
+            continue
+        off += 1
+        labels.append(data[off:off + length].decode("utf-8", "replace"))
+        off += length
+        if not jumped:
+            start = off
+
+
+def _parse_records(data: bytes) -> List[Dict[str, Any]]:
+    """Turn a DNS message into a flat list of records we care about."""
+    if len(data) < 12:
+        return []
+    _id, _flags, questions, answers, authority, additional = struct.unpack(">HHHHHH", data[:12])
+    off = 12
+    for _ in range(questions):
+        _, off = _parse_name(data, off)
+        off += 4
+    records = []
+    for _ in range(answers + authority + additional):
+        name, off = _parse_name(data, off)
+        if off + 10 > len(data):
+            break
+        rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+        off += 10
+        if off + rdlen > len(data):
+            # A truncated packet. The declared length is not a promise the bytes
+            # are there, so nothing from here on can be trusted.
+            break
+        rdata = data[off:off + rdlen]
+        name = name.rstrip(".")
+        if rtype == 12:                                    # PTR
+            value, _ = _parse_name(data, off)
+            records.append({"name": name, "type": "PTR", "value": value.rstrip(".")})
+        elif rtype == 33 and rdlen >= 6:                   # SRV
+            _prio, _weight, port = struct.unpack(">HHH", rdata[:6])
+            target, _ = _parse_name(data, off + 6)
+            records.append({"name": name, "type": "SRV", "port": port,
+                            "target": target.rstrip(".")})
+        elif rtype == 16:                                  # TXT
+            # TXT strings are length-prefixed, not null-separated. Splitting on
+            # null turns the whole record into one blob and loses every key.
+            fields: Dict[str, str] = {}
+            i = 0
+            while i < len(rdata):
+                length = rdata[i]
+                i += 1
+                chunk = rdata[i:i + length]
+                i += length
+                if b"=" in chunk:
+                    key, _, value = chunk.partition(b"=")
+                    fields[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+            records.append({"name": name, "type": "TXT", "value": fields})
+        elif rtype == 1 and rdlen == 4:                    # A
+            records.append({"name": name, "type": "A",
+                            "value": socket.inet_ntoa(rdata)})
+        off += rdlen
+    return records
+
+
+def _mdns_socket():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    sock.bind(("", MDNS_PORT))
+    membership = struct.pack("=4sl", socket.inet_aton(MDNS_GROUP), socket.INADDR_ANY)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    return sock
+
+
+def _mdns_query(sock, name: str, qtype: int, wait: float) -> List[Dict[str, Any]]:
+    header = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
+    packet = header + _encode_name(name) + struct.pack(">HH", qtype, 1)
+    sock.sendto(packet, (MDNS_GROUP, MDNS_PORT))
+    sock.settimeout(0.4)
+    deadline = time.time() + wait
+    records: List[Dict[str, Any]] = []
+    while time.time() < deadline:
+        try:
+            data, _addr = sock.recvfrom(9000)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        records.extend(_parse_records(data))
+    return records
+
+
+def discover_mdns(wait: float = MDNS_TIMEOUT) -> List[Dict[str, Any]]:
+    """Find every Tuneshine on the LAN.
+
+    Returns dicts with name, host (IP or IP:port), ip, port and txt. Returns an
+    empty list when mDNS is unavailable, which is not an error: callers fall back
+    to a configured address.
+    """
+    instances: Dict[str, bool] = {}
+    srv: Dict[str, Tuple[str, int]] = {}
+    addrs: Dict[str, str] = {}
+    txt: Dict[str, Dict[str, str]] = {}
+
+    try:
+        sock = _mdns_socket()
+    except OSError as exc:
+        print("mDNS unavailable: %s" % exc, file=sys.stderr)
+        return []
+
+    try:
+        for record in _mdns_query(sock, MDNS_SERVICE, 12, wait):
+            if record["type"] == "PTR" and record["value"].endswith(MDNS_SERVICE):
+                instances[record["value"]] = True
+            elif record["type"] == "SRV":
+                srv[record["name"]] = (record["target"], record["port"])
+            elif record["type"] == "TXT":
+                txt[record["name"]] = record["value"]
+            elif record["type"] == "A":
+                addrs[record["name"]] = record["value"]
+
+        # An instance whose A record did not arrive gets one follow-up query.
+        for instance in list(instances):
+            target, _port = srv.get(instance, (None, 0))
+            if target and target not in addrs:
+                for record in _mdns_query(sock, target, 1, 2.0):
+                    if record["type"] == "A":
+                        addrs[record["name"]] = record["value"]
+    except OSError as exc:
+        print("mDNS query failed: %s" % exc, file=sys.stderr)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    found = []
+    for instance in sorted(instances):
+        target, port = srv.get(instance, (None, 0))
+        ip = addrs.get(target) if target else None
+        if not ip:
+            continue
+        port = port or 80
+        found.append({
+            "name": instance.rsplit("." + MDNS_SERVICE, 1)[0],
+            "ip": ip,
+            "port": port,
+            "host": ip if port == 80 else "%s:%d" % (ip, port),
+            "txt": txt.get(instance, {}),
+        })
+    return found
+
+
+def print_devices(found: List[Dict[str, Any]]) -> None:
+    if not found:
+        print("no Tuneshine found on this network")
+        return
+    for device in found:
+        details = device["txt"]
+        extras = " ".join("%s=%s" % (k, details[k]) for k in sorted(details))
+        print("%-28s %-16s %s" % (device["name"], device["host"], extras))
+
+
+# --------------------------------------------------------------------------
 # Uploading to the panel
 # --------------------------------------------------------------------------
 UPLOAD_TIMEOUT = 8
@@ -663,9 +876,18 @@ def upload_frame(host: str, payload: bytes, phrase: str, hhmm: str,
 def push_to_devices(config: Dict[str, Any], img: Image.Image, phrase: str,
                     hhmm: str) -> int:
     """Upload one frame to every configured panel. Returns the failure count."""
-    devices = config.get("devices") or []
+    devices = list(config.get("devices") or [])
     if not devices:
-        print("no devices configured; set \"devices\" to a list of hosts", file=sys.stderr)
+        # No address given, so ask the network. This is the path a fresh install
+        # takes: copy the example config, run --push, and it finds the panel.
+        print("no device configured, looking on the network")
+        wait = float(config.get("mdns_timeout") or MDNS_TIMEOUT)
+        devices = [d["host"] for d in discover_mdns(wait)]
+        if devices:
+            print("  found %s" % ", ".join(devices))
+    if not devices:
+        print("no Tuneshine found and none configured; set \"devices\" to a host",
+              file=sys.stderr)
         return 1
 
     payload = encode_webp(img)
@@ -769,11 +991,17 @@ def main() -> int:
     ap.add_argument("--swatches", default=None, help="render every preset to this path")
     ap.add_argument("--emit-config", action="store_true",
                     help="print the resolved config this frame was drawn with")
+    ap.add_argument("--discover", action="store_true",
+                    help="list the Tuneshines found on the network, then exit")
     ap.add_argument("--push", action="store_true",
                     help="render the current time and upload it to the configured panels")
     ap.add_argument("--device", action="append", default=None, metavar="HOST",
                     help="panel host for --push; repeatable, overrides the config list")
     args = ap.parse_args()
+
+    if args.discover:
+        print_devices(discover_mdns())
+        return 0
 
     if args.swatches:
         _swatches(args.swatches)

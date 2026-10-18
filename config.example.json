@@ -1,7 +1,6 @@
 {
-  "devices": [
-    "192.168.1.19"
-  ],
+  "devices": [],
+  "mdns_timeout": 4,
   "label": "Hebrew word clock",
   "timezone": "local",
   "respect_playback": true,
