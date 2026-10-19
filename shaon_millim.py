@@ -779,7 +779,7 @@ def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None,
         tiles = _tiles_for(lines, size, pal, opts["nikkud"], opts["word_gap"],
                            opts["tracking"]) or []
         positions = _static_tops(tiles, line_height)
-        fits = (all(t[0].width <= MAX_W for t in tiles)
+        fits = (all(t[0].width <= SIZE for t in tiles)
                 and all(0 <= top and top + t[0].height <= SIZE
                         for top, t in zip(positions, tiles)))
     else:
@@ -813,7 +813,11 @@ def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None,
         "widest": widest,
         "limit": MAX_W,
         "chars": longest,
-        "fits": bool(fits and widest <= MAX_W),
+        # fits means the ink is inside the panel. margin_ok means it also keeps the
+        # 5px margin the layout is drawn against; a line may honour one and not the
+        # other, and only the first can clip anything.
+        "fits": bool(fits and widest <= SIZE),
+        "margin_ok": bool(widest <= MAX_W),
         "brightness": brightness,
         "word_gap": opts["word_gap"],
     }

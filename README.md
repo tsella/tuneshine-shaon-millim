@@ -327,8 +327,10 @@ Two knobs adjust this, both in pixels and both off by default:
   12px each word of a long phrase usually gets its own line, so check `--emit-config`
   before expecting a change.
 
-Both are measured into wrapping and fitting, so a gap that pushes a line past the panel
-is reported as `OVERFLOWS` rather than silently clipped.
+Both are measured into wrapping and fitting. `fits` means the ink is inside the 64px
+panel; a line can also exceed the 5px margin the layout is drawn against without
+clipping, which is reported separately as `margin_ok` rather than as a failure. At
+tracking 1, 54 of the 1440 minutes land at 60px: inside the panel, past the margin.
 
 ## How the Hebrew works
 

@@ -686,6 +686,15 @@ class TestSpacing(Base):
         self.assertGreater(info["widest"], sm.MAX_W)
         self.assertFalse(info["fits"], "an overflowing line has to say so")
 
+    def test_margin_tightness_is_not_reported_as_a_clipping_failure(self):
+        """At tracking 1, 54 of the 1440 minutes come out 60px: inside the 64px panel,
+        past the 59px margin. Only the first can clip anything."""
+        cfg = dict(self.CFG, render=dict(self.CFG["render"], tracking=1))
+        _img, tight = sm.render(1, 8, cfg)
+        self.assertEqual(tight["widest"], 60)
+        self.assertTrue(tight["fits"], "60px is inside the panel")
+        self.assertFalse(tight["margin_ok"], "60px is past the 59px margin")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
