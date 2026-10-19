@@ -19,7 +19,9 @@
     "line_gap": 2,
     "nikkud": "color",
     "align": "right",
-    "antialias": true
+    "antialias": true,
+    "word_gap": 0,
+    "tracking": 0
   },
   "fonts": {
     "path": null,

@@ -649,5 +649,43 @@ class TestNightDim(Base):
         self.assertIsNone(sm.sun_times({"location": "off"}, now=datetime(2026, 10, 19, 12, 0)))
 
 
+class TestSpacing(Base):
+    """Letter and word spacing. Both default to 0, which must draw exactly what the
+    single-string path drew before these knobs existed."""
+
+    CFG = {"colors": {"preset": "shabbat"},
+           "render": {"sizing": "static", "size": 12, "line_height": 16}}
+
+    def _render(self, **render):
+        cfg = dict(self.CFG, render=dict(self.CFG["render"], **render))
+        return sm.render(9, 41, cfg)
+
+    def test_tracking_widens_the_line(self):
+        widths = [self._render(tracking=t)[1]["widest"] for t in (0, 1, 2)]
+        self.assertEqual(widths, sorted(widths))
+        self.assertLess(widths[0], widths[-1])
+
+    def test_tracking_zero_draws_the_same_pixels_as_no_option(self):
+        plain, _ = self._render()
+        zero, _ = self._render(tracking=0)
+        self.assertEqual(list(plain.getdata()), list(zero.getdata()))
+
+    def test_word_gap_cannot_widen_a_line_that_holds_one_word(self):
+        # At 12px every word of 09:41 gets its own line, so there is no gap to widen.
+        plain, plain_info = self._render()
+        _gapped, gapped_info = self._render(word_gap=4)
+        self.assertEqual(plain_info["widest"], gapped_info["widest"])
+
+    def test_nonsense_spacing_is_refused(self):
+        for block in ({"tracking": 99}, {"tracking": -99}, {"word_gap": 99}, {"word_gap": -99}):
+            with self.assertRaises(ValueError, msg=block):
+                sm.resolve_render({"render": block})
+
+    def test_overwide_tracking_is_reported_rather_than_clipped(self):
+        _img, info = self._render(tracking=6)
+        self.assertGreater(info["widest"], sm.MAX_W)
+        self.assertFalse(info["fits"], "an overflowing line has to say so")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

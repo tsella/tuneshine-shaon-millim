@@ -25,6 +25,7 @@ import os
 import re
 import socket
 import struct
+import unicodedata
 import sys
 import time
 from dataclasses import dataclass
@@ -472,7 +473,23 @@ def _kw() -> Dict[str, str]:
     return {"direction": "rtl", "language": "he"} if HAS_RAQM else {}
 
 
-def _ink_width(text: str, font: ImageFont.FreeTypeFont) -> int:
+def _ink_width(text: str, font: ImageFont.FreeTypeFont, word_gap: int = 0,
+               tracking: int = 0) -> int:
+    """Width of the ink, with `word_gap` extra pixels between words.
+
+    With word_gap 0 this measures the shaped string, which is what the renderer
+    draws. With a gap set, words are measured and placed separately, so the width
+    is the sum of the word widths plus the gaps.
+    """
+    if word_gap or tracking:
+        words = [w for w in text.split(" ") if w]
+        if not words:
+            return 0
+        total = 0
+        for word in words:
+            offsets = [o for o in (_ink_offsets(c, font) for c in _clusters(word)) if o]
+            total += sum(o[0] - o[1] for o in offsets) + tracking * max(0, len(offsets) - 1)
+        return total + word_gap * (len(words) - 1)
     core = font.getmask(text, mode="L", **_kw())
     if core.size == (0, 0):
         return 0
@@ -481,14 +498,17 @@ def _ink_width(text: str, font: ImageFont.FreeTypeFont) -> int:
     return 0 if box is None else box[2] - box[0]
 
 
-def wrap(tokens: List[Token], font: ImageFont.FreeTypeFont) -> List[List[Token]]:
+def wrap(tokens: List[Token], font: ImageFont.FreeTypeFont, word_gap: int = 0,
+         tracking: int = 0) -> List[List[Token]]:
     """Break on measured ink. The period always starts its own line."""
     lines: List[List[Token]] = []
     current: List[Token] = []
     for tok in tokens:
         trial = current + [tok]
         role_break = bool(current and (current[0].role == "period") != (tok.role == "period"))
-        if current and (role_break or _ink_width(" ".join(t.text for t in trial), font) > MAX_W):
+        if current and (role_break or
+                        _ink_width(" ".join(t.text for t in trial), font, word_gap,
+                                  tracking) > MAX_W):
             lines.append(current)
             current = [tok]
         else:
@@ -506,6 +526,8 @@ RENDER_DEFAULTS: Dict[str, Any] = {
     "nikkud": "color",      # color | full | none
     "align": "right",       # right | center
     "antialias": True,      # False snaps edge pixels back to the background
+    "word_gap": 0,          # extra pixels between words, on top of the font's space
+    "tracking": 0,          # extra pixels between letters; negative tightens
 }
 NIKKUD_MODES = ("color", "full", "none")
 SIZING_MODES = ("fit", "static")
@@ -547,6 +569,14 @@ def resolve_render(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     opts["line_gap"] = int(opts["line_gap"])
     if not 0 <= opts["line_gap"] <= 12:
         raise ValueError("render.line_gap must be 0-12, got %d" % opts["line_gap"])
+
+    opts["word_gap"] = int(opts["word_gap"])
+    if not -4 <= opts["word_gap"] <= 16:
+        raise ValueError("render.word_gap must be -4 to 16, got %d" % opts["word_gap"])
+
+    opts["tracking"] = int(opts["tracking"])
+    if not -3 <= opts["tracking"] <= 6:
+        raise ValueError("render.tracking must be -3 to 6, got %d" % opts["tracking"])
     return opts
 
 
@@ -557,8 +587,70 @@ def _line_colors(line: List[Token], pal: Palette) -> Tuple[Tuple[int, int, int],
     return pal.letter, pal.nikkud
 
 
+def _paint_word(d: ImageDraw.ImageDraw, anchor: int, text: str, font: ImageFont.FreeTypeFont,
+                letter: Tuple[int, int, int], nikkud: Tuple[int, int, int], mode: str) -> None:
+    """Draw one word so that its anchor is its right edge."""
+    if mode == "none":
+        d.text((anchor, 32), strip_nikkud(text), font=font, fill=letter, anchor="rm", **_kw())
+    elif mode == "full":
+        d.text((anchor, 32), text, font=font, fill=letter, anchor="rm", **_kw())
+    else:
+        d.text((anchor, 32), text, font=font, fill=nikkud, anchor="rm", **_kw())
+        d.text((anchor, 32), strip_nikkud(text), font=font, fill=letter, anchor="rm", **_kw())
+
+
+def _ink_offsets(text: str, font: ImageFont.FreeTypeFont) -> Optional[Tuple[int, int]]:
+    """How far a word's ink starts and ends from its anchor point."""
+    probe = Image.new("L", (192, 64), 0)
+    ImageDraw.Draw(probe).text((188, 32), text, font=font, fill=255, anchor="rm", **_kw())
+    box = probe.getbbox()
+    return None if box is None else (188 - box[0], 188 - box[2])
+
+
+def _clusters(text: str) -> List[str]:
+    """Split into letters, each with the vowel points that belong to it.
+
+    A cluster is drawn as one shaped run, so the points stay on their letter. Only
+    the advance between clusters is what tracking changes.
+    """
+    out: List[str] = []
+    for ch in text:
+        if unicodedata.combining(ch) and out:
+            out[-1] += ch
+        else:
+            out.append(ch)
+    return out
+
+
+def _cluster_offsets(cluster: str, font: ImageFont.FreeTypeFont) -> Optional[Tuple[int, int]]:
+    return _ink_offsets(cluster, font)
+
+
+def _paint_words(d: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
+                 letter: Tuple[int, int, int], nikkud: Tuple[int, int, int], mode: str,
+                 word_gap: int, tracking: int = 0) -> None:
+    """Draw a line word by word, with `word_gap` blank pixels between the inks.
+
+    Drawing the string in one call puts the font's own space between words, which
+    at 12px is 2.7px: barely wider than the widest letter pair the face produces
+    (2px). A word boundary then looks like letter spacing, which is exactly how a
+    loose pair next to a narrow letter reads as a break. Placing the words by their
+    ink edges gives a gap the reader can actually see.
+    """
+    right = 188
+    for word in [w for w in text.split(" ") if w]:
+        for cluster in _clusters(word):
+            offsets = _cluster_offsets(cluster, font)
+            if offsets is None:
+                continue
+            _paint_word(d, right + offsets[1], cluster, font, letter, nikkud, mode)
+            right = right - (offsets[0] - offsets[1]) - tracking
+        right -= word_gap
+
+
 def _line_tile(line: List[Token], size: int, letter: Tuple[int, int, int],
-               nikkud: Tuple[int, int, int], mode: str = "color"
+               nikkud: Tuple[int, int, int], mode: str = "color", word_gap: int = 0,
+               tracking: int = 0
                ) -> Optional[Tuple[Image.Image, Image.Image]]:
     """Render one line to an ink-cropped tile.
 
@@ -568,17 +660,13 @@ def _line_tile(line: List[Token], size: int, letter: Tuple[int, int, int],
     letter colour, "none" drops the points.
     """
     text = " ".join(t.text for t in line)
-    bare = strip_nikkud(text)
     font = _font(size)
     scratch = Image.new("RGB", (192, 64), (0, 0, 0))
     d = ImageDraw.Draw(scratch)
-    if mode == "none":
-        d.text((188, 32), bare, font=font, fill=letter, anchor="rm", **_kw())
-    elif mode == "full":
-        d.text((188, 32), text, font=font, fill=letter, anchor="rm", **_kw())
+    if word_gap or tracking:
+        _paint_words(d, text, font, letter, nikkud, mode, word_gap, tracking)
     else:
-        d.text((188, 32), text, font=font, fill=nikkud, anchor="rm", **_kw())
-        d.text((188, 32), bare, font=font, fill=letter, anchor="rm", **_kw())
+        _paint_word(d, 188, text, font, letter, nikkud, mode)
 
     box = scratch.convert("L").point(lambda v: 255 if v > 12 else 0).getbbox()
     if box is None:
@@ -587,11 +675,12 @@ def _line_tile(line: List[Token], size: int, letter: Tuple[int, int, int],
     return tile, tile.convert("L").point(lambda v: 255 if v > 12 else 0)
 
 
-def _tiles_for(lines: List[List[Token]], size: int, pal: Palette, mode: str):
+def _tiles_for(lines: List[List[Token]], size: int, pal: Palette, mode: str,
+               word_gap: int = 0, tracking: int = 0):
     tiles = []
     for line in lines:
         letter, nikkud = _line_colors(line, pal)
-        tile = _line_tile(line, size, letter, nikkud, mode)
+        tile = _line_tile(line, size, letter, nikkud, mode, word_gap, tracking)
         if tile is None:
             return None
         tiles.append(tile)
@@ -603,23 +692,23 @@ def _packed_height(tiles, gap: int) -> int:
 
 
 def fit(tokens: List[Token], pal: Palette, mode: str = "color", gap: int = GAP,
-        hi: int = 26, lo: int = 8):
+        hi: int = 26, lo: int = 8, word_gap: int = 0, tracking: int = 0):
     """Pick the largest size whose packed tiles fit the panel.
 
     Returns (size, lines, tiles, fits). `fits` is False only when even the
     smallest size overflows, which the caller should report rather than hide.
     """
     for size in range(hi, lo - 1, -1):
-        lines = wrap(tokens, _font(size))
-        tiles = _tiles_for(lines, size, pal, mode)
+        lines = wrap(tokens, _font(size), word_gap, tracking)
+        tiles = _tiles_for(lines, size, pal, mode, word_gap, tracking)
         if tiles is None:
             continue
         if (all(t[0].width <= MAX_W for t in tiles)
                 and _packed_height(tiles, gap) <= SIZE):
             return size, lines, tiles, True
 
-    lines = wrap(tokens, _font(lo))
-    tiles = _tiles_for(lines, lo, pal, mode) or []
+    lines = wrap(tokens, _font(lo), word_gap, tracking)
+    tiles = _tiles_for(lines, lo, pal, mode, word_gap, tracking) or []
     return lo, lines, tiles, False
 
 
@@ -686,14 +775,16 @@ def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None,
     if static:
         size = opts["size"] or STATIC_SIZE_DEFAULT
         line_height = opts["line_height"] or size + 4
-        lines = wrap(tokens, _font(size))
-        tiles = _tiles_for(lines, size, pal, opts["nikkud"]) or []
+        lines = wrap(tokens, _font(size), opts["word_gap"], opts["tracking"])
+        tiles = _tiles_for(lines, size, pal, opts["nikkud"], opts["word_gap"],
+                           opts["tracking"]) or []
         positions = _static_tops(tiles, line_height)
         fits = (all(t[0].width <= MAX_W for t in tiles)
                 and all(0 <= top and top + t[0].height <= SIZE
                         for top, t in zip(positions, tiles)))
     else:
-        size, lines, tiles, fits = fit(tokens, pal, opts["nikkud"], opts["line_gap"])
+        size, lines, tiles, fits = fit(tokens, pal, opts["nikkud"], opts["line_gap"],
+                                       word_gap=opts["word_gap"], tracking=opts["tracking"])
         block = _packed_height(tiles, opts["line_gap"])
         positions, y = [], max(0, (SIZE - block) // 2)
         for tile, _mask in tiles:
@@ -724,6 +815,7 @@ def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None,
         "chars": longest,
         "fits": bool(fits and widest <= MAX_W),
         "brightness": brightness,
+        "word_gap": opts["word_gap"],
     }
     return img, info
 
@@ -1192,6 +1284,10 @@ def main() -> int:
     ap.add_argument("--line-height", type=int, default=None,
                     help="line pitch for static (default: size + 4)")
     ap.add_argument("--gap", type=int, default=None, help="pixels between lines in fit mode")
+    ap.add_argument("--word-gap", type=int, default=None, metavar="N",
+                    help="extra pixels between words (default 0)")
+    ap.add_argument("--tracking", type=int, default=None, metavar="N",
+                    help="extra pixels between letters; negative tightens")
     ap.add_argument("--brightness", type=int, default=None, metavar="N",
                     help="dim the frame to N percent (0-100); --push works this out itself "
                          "from sunrise and sunset")
@@ -1244,6 +1340,8 @@ def main() -> int:
             "align": args.align,
             "antialias": False if args.crisp else None,
             "line_gap": args.gap,
+            "word_gap": args.word_gap,
+            "tracking": args.tracking,
         },
     }
     for block in ("colors", "render"):

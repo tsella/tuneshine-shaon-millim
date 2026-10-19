@@ -139,6 +139,8 @@ values.
 | `render.nikkud` | `"color"` | `color`, `full`, or `none`. |
 | `render.align` | `"right"` | `right` or `center`. |
 | `render.antialias` | `true` | `false` snaps every pixel to a palette colour. |
+| `render.tracking` | `0` | Extra pixels between letters. Negative tightens. |
+| `render.word_gap` | `0` | Extra pixels between words, on top of the font's own space. |
 | `fonts.path` | `null` | Font file to use. `null` means the bundled one. |
 | `fonts.weight` | `null` | Named instance, for example `Bold`. |
 | `location` | `"auto"` | `auto` looks the panel's position up by IP, `off` disables it. |
@@ -301,6 +303,32 @@ Preview a level without editing the config:
 ```sh
 python3 shaon_millim.py --time 23:30 --brightness 30 --simulate --out night.png
 ```
+
+
+## Letter and word spacing
+
+Frank Ruhl Libre is a text serif, and at 12px it rasterises unevenly: measured across
+the 53 letter pairs the clock can show, the blank gap between strokes averages 0.6px
+with a standard deviation of 0.7px, and the widest pairs reach 2px. Where a shin is
+followed by a vav or a yod, or where any narrow letter sits in a tight pair, the
+result reads as a break in the word.
+
+Two knobs adjust this, both in pixels and both off by default:
+
+```json
+"render": { "tracking": 1, "word_gap": 0 }
+```
+
+- `tracking` moves every letter apart, or together when negative. At 12px, `+1` adds
+  about one pixel per letter, `+2` two. It is the knob for a crowded word.
+- `word_gap` widens the gap between words only, on top of the font's own space. The
+  font's space at 12px is 2.7px, which is why a word boundary can look like letter
+  spacing. This only has an effect on a line that holds more than one word, and at
+  12px each word of a long phrase usually gets its own line, so check `--emit-config`
+  before expecting a change.
+
+Both are measured into wrapping and fitting, so a gap that pushes a line past the panel
+is reported as `OVERFLOWS` rather than silently clipped.
 
 ## How the Hebrew works
 
