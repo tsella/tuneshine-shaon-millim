@@ -12,10 +12,12 @@ import io
 import json
 import os
 import tempfile
+import time
 import socket
 import struct
 import sys
 import unittest
+from datetime import datetime
 
 from PIL import Image
 
@@ -461,8 +463,13 @@ class TestExampleConfig(Base):
 
     def test_the_example_has_every_documented_key(self):
         expected = {"devices", "mdns_timeout", "label", "timezone", "respect_playback",
-                    "colors", "render", "fonts"}
+                    "colors", "render", "fonts", "location", "latitude", "longitude",
+                    "night_dim"}
         self.assertEqual(set(self.cfg), expected)
+
+    def test_night_defaults_match_the_code(self):
+        for key, expected in sm.NIGHT_DIM_DEFAULT.items():
+            self.assertEqual(self.cfg["night_dim"].get(key), expected, key)
 
     def test_the_example_is_valid_for_the_renderer(self):
         img, info = sm.render(9, 41, {"colors": self.cfg["colors"],
@@ -521,6 +528,125 @@ class TestPushUsesDiscovery(Base):
         _code, seen = self._run([{"name": "x", "host": "10.0.0.5", "txt": {}}],
                                 {"mdns_timeout": 2.5})
         self.assertEqual(seen["wait"], 2.5)
+
+
+class TestNightDim(Base):
+    """Sunset and sunrise scale the frame's pixels. Device luminance is never touched."""
+
+    SUN = {"sunrise": "2026-10-19T07:11", "sunset": "2026-10-19T18:09", "date": "2026-10-19"}
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        original_dir, original_file = sm.STATE_DIR, sm.SUN_STATE
+        sm.STATE_DIR = self.dir.name
+        sm.SUN_STATE = os.path.join(self.dir.name, "sun.json")
+        self.addCleanup(setattr, sm, "STATE_DIR", original_dir)
+        self.addCleanup(setattr, sm, "SUN_STATE", original_file)
+
+    def _bright(self, at, **night):
+        cfg = {"night_dim": {"enabled": True, "percent": 10, **night}}
+        return sm.night_brightness(cfg, self.SUN, datetime(*at))
+
+    def _stub_fetch(self, result):
+        original = sm.fetch_sun
+        calls = []
+
+        def fake(lat, lon):
+            calls.append((lat, lon))
+            return result
+
+        sm.fetch_sun = fake
+        self.addCleanup(setattr, sm, "fetch_sun", original)
+        return calls
+
+    def test_daylight_is_full_brightness(self):
+        for at in ((2026, 10, 19, 12, 0), (2026, 10, 19, 7, 11), (2026, 10, 19, 18, 8)):
+            self.assertEqual(self._bright(at), (100, False), at)
+
+    def test_night_is_the_configured_percent(self):
+        for at in ((2026, 10, 19, 18, 9), (2026, 10, 19, 23, 30),
+                   (2026, 10, 19, 0, 30), (2026, 10, 19, 7, 10)):
+            self.assertEqual(self._bright(at), (10, True), at)
+
+    def test_sunset_is_inclusive_and_sunrise_is_exclusive(self):
+        self.assertEqual(self._bright((2026, 10, 19, 18, 9)), (10, True))
+        self.assertEqual(self._bright((2026, 10, 19, 7, 11)), (100, False))
+
+    def test_switching_it_off_leaves_the_frame_alone(self):
+        cfg = {"night_dim": {"enabled": False, "percent": 10}}
+        self.assertEqual(sm.night_brightness(cfg, self.SUN, datetime(2026, 10, 19, 23, 30)),
+                         (100, False))
+
+    def test_missing_or_unparsable_times_never_dim(self):
+        cfg = {"night_dim": {"enabled": True, "percent": 10}}
+        at = datetime(2026, 10, 19, 23, 30)
+        self.assertEqual(sm.night_brightness(cfg, None, at), (100, False))
+        self.assertEqual(sm.night_brightness(cfg, {"sunrise": None, "sunset": "x"}, at), (100, False))
+        self.assertEqual(sm.night_brightness(cfg, {"sunrise": "nope", "sunset": "also"}, at),
+                         (100, False))
+
+    def test_percent_is_clamped_and_junk_falls_back_to_full(self):
+        self.assertEqual(self._bright((2026, 10, 19, 23, 30), percent=-20), (0, True))
+        self.assertEqual(self._bright((2026, 10, 19, 23, 30), percent=250), (100, True))
+        self.assertEqual(self._bright((2026, 10, 19, 23, 30), percent="dark"), (100, False))
+
+    def test_dimming_a_frame_scales_every_channel(self):
+        img = Image.new("RGB", (1, 1))
+        img.putpixel((0, 0), (200, 100, 50))
+        self.assertEqual(sm.dim_frame(img, 50).getpixel((0, 0)), (100, 50, 25))
+        self.assertIs(sm.dim_frame(img, 100), img)
+
+    def test_a_heavily_dimmed_frame_still_draws_the_text(self):
+        """Dimming the palette used to erase the frame: _line_tile cuts its mask at
+        an absolute luminance, so a dim palette fell under it and every line was
+        dropped. Dimming the finished frame keeps the geometry."""
+        cfg = {"colors": {"preset": "shabbat"}, "render": {"sizing": "static", "size": 12}}
+        full, _ = sm.render(0, 14, cfg, brightness=100)
+        dim, _ = sm.render(0, 14, cfg, brightness=10)
+        self.assertGreater(full.convert("L").getextrema()[1], 100)
+        self.assertGreater(dim.convert("L").getextrema()[1], 0, "text vanished")
+        self.assertLess(dim.convert("L").getextrema()[1], full.convert("L").getextrema()[1] // 3)
+
+    def test_a_dimmed_frame_carries_less_light(self):
+        cfg = {"colors": {"preset": "shabbat"}, "render": {"sizing": "static", "size": 12}}
+
+        def total(img):
+            return sum(sum(px) for px in img.convert("RGB").getdata())
+
+        bright, _ = sm.render(9, 41, cfg, brightness=100)
+        dim, info = sm.render(9, 41, cfg, brightness=20)
+        self.assertEqual(info["brightness"], 20)
+        self.assertLess(total(dim), total(bright) * 0.35)
+        self.assertGreater(total(dim), 0, "a dim frame is not a blank frame")
+
+    def test_todays_times_are_served_from_the_cache_without_a_request(self):
+        sm.save_sun_state(dict(self.SUN))
+        self._stub_fetch(self.fail)     # any fetch is a bug
+        self.assertEqual(sm.sun_times({}, now=datetime(2026, 10, 19, 12, 0)), self.SUN)
+
+    def test_a_failed_fetch_keeps_the_previous_days_times(self):
+        sm.save_sun_state({"sunrise": "2026-10-18T07:07", "sunset": "2026-10-18T18:15",
+                           "date": "2026-10-18", "latitude": 40.7, "longitude": -74.0,
+                           "located_at": time.time()})
+        self._stub_fetch(None)
+        got = sm.sun_times({}, now=datetime(2026, 10, 19, 12, 0))
+        self.assertEqual((got["sunrise"], got["sunset"]), ("2026-10-18T07:07", "2026-10-18T18:15"))
+
+    def test_a_stale_cache_is_refetched_and_written_back(self):
+        sm.save_sun_state({"sunrise": "2026-10-18T07:07", "sunset": "2026-10-18T18:15",
+                           "date": "2026-10-18", "latitude": 40.7, "longitude": -74.0,
+                           "located_at": time.time()})
+        self._stub_fetch({"sunrise": "2026-10-19T07:11", "sunset": "2026-10-19T18:09",
+                          "date": "2026-10-19"})
+        got = sm.sun_times({}, now=datetime(2026, 10, 19, 12, 0))
+        self.assertEqual(got["sunrise"], "2026-10-19T07:11")
+        self.assertEqual(sm.load_sun_state()["sunrise"], "2026-10-19T07:11")
+
+    def test_location_off_disables_the_lookup(self):
+        self._stub_fetch(self.fail)
+        self.assertIsNone(sm.sun_times({"location": "off"}, now=datetime(2026, 10, 19, 12, 0)))
 
 
 if __name__ == "__main__":

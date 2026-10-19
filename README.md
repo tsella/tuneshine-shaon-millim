@@ -31,6 +31,9 @@ by Yanek Iontef, used under the SIL Open Font Licence. The licence text is in
 - Pillow, built with libraqm. Raqm is what shapes Hebrew correctly, including the
   vowel points.
 - A Tuneshine on the same network, reachable by HTTP.
+- `requests`, for talking to the panel. Night dimming also uses it to look up
+  sunrise and sunset, which needs internet; without it the clock stays at full
+  brightness.
 
 ```
 pip install pillow
@@ -123,7 +126,7 @@ values.
 | `label` | `"Hebrew word clock"` | Artist name shown on the device for this image. |
 | `timezone` | `"local"` | `local`, or an IANA name such as `Asia/Jerusalem`. |
 | `respect_playback` | `true` | Skip the upload while the panel is playing music. |
-| `colors.preset` | `"oled-warm"` | One of the presets in [Colours](#colours). |
+| `colors.preset` | `"shabbat"` | One of the presets in [Colours](#colours). |
 | `colors.background` | `null` | Hex override for the panel background. |
 | `colors.letter` | `null` | Hex override for the letters. |
 | `colors.nikkud` | `null` | Hex override for the vowel points. |
@@ -138,6 +141,11 @@ values.
 | `render.antialias` | `true` | `false` snaps every pixel to a palette colour. |
 | `fonts.path` | `null` | Font file to use. `null` means the bundled one. |
 | `fonts.weight` | `null` | Named instance, for example `Bold`. |
+| `location` | `"auto"` | `auto` looks the panel's position up by IP, `off` disables it. |
+| `latitude` | `null` | Set to skip the lookup and pin the position. |
+| `longitude` | `null` | As above. |
+| `night_dim.enabled` | `true` | Dim the frame between sunset and sunrise. |
+| `night_dim.percent` | `10` | Frame brightness at night, 0-100. |
 
 A `null` in the colours block means "keep the preset's colour", not "no colour".
 
@@ -235,10 +243,10 @@ points, and the day-period word (*בבוקר*, *בערב*, *בלילה*). Seven 
 
 | preset | look |
 |---|---|
-| `oled-warm` | warm white letters, amber points, grey period. The default |
+| `oled-warm` | warm white letters, amber points, grey period |
 | `eink` | dark letters on paper grey, for a printed look |
 | `cyber` | cyan letters, rose points, violet period |
-| `shabbat` | amber letters on deep blue, with a blue period |
+| `shabbat` | amber letters on deep blue, with a blue period. The default |
 | `emerald` | near-white letters, green points |
 | `crimson-night` | pale rose letters, crimson points |
 | `dynamic` | changes with the hour of the day |
@@ -248,7 +256,7 @@ Any layer can be overridden with a hex value, whatever the preset:
 
 ```json
 "colors": {
-  "preset": "oled-warm",
+  "preset": "shabbat",
   "letter": "#E8F0FF",
   "nikkud": "#38BDF8"
 }
@@ -256,6 +264,43 @@ Any layer can be overridden with a hex value, whatever the preset:
 
 A layer left at `null` keeps the preset's colour. `colors.period_luminance`
 dims the day-period word so the time itself leads.
+
+
+## Night dimming
+
+The frame can dim between sunset and sunrise. This never touches the panel's own
+luminance setting: the 64x64 frame the device receives is scaled, so the device keeps
+whatever brightness you set on it.
+
+```json
+"night_dim": { "enabled": true, "percent": 10 }
+```
+
+Sunrise and sunset come from Open-Meteo's daily block, for the panel's position. Set
+`latitude` and `longitude` to pin it, or leave them and `location: "auto"` asks ipinfo
+once a day, caching the answer in `~/.cache/tuneshine-shaon-millim/sun.json`.
+`location: "off"` skips the lookup, and with no position there is no dimming.
+
+The times are cached per local date, so a once-a-minute cron makes two requests a day
+rather than 1,440. A failed fetch keeps the previous day's times, which are a minute
+out at most, instead of jumping to full brightness.
+
+`--push` says which side of sunset it landed on:
+
+```
+00:14  static · 12px · 2 lines  [night 10%]  חצות וארבע עשרה
+```
+
+Measured on the `shabbat` preset, the brightest pixel at each level is 10% (25,23,13),
+30% (75,69,41), 50% (126,115,69), against a background of (0,1,3) at 10%. At 10% the
+panel is a night light you read from close by; 30% is where the letters carry across a
+dark room. Percent 0 draws a black frame and the panel looks off.
+
+Preview a level without editing the config:
+
+```sh
+python3 shaon_millim.py --time 23:30 --brightness 30 --simulate --out night.png
+```
 
 ## How the Hebrew works
 

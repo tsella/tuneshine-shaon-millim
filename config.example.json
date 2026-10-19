@@ -5,7 +5,7 @@
   "timezone": "local",
   "respect_playback": true,
   "colors": {
-    "preset": "oled-warm",
+    "preset": "shabbat",
     "background": null,
     "letter": null,
     "nikkud": null,
@@ -24,5 +24,12 @@
   "fonts": {
     "path": null,
     "weight": null
+  },
+  "location": "auto",
+  "latitude": null,
+  "longitude": null,
+  "night_dim": {
+    "enabled": true,
+    "percent": 10
   }
 }

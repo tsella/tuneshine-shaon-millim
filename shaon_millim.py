@@ -106,7 +106,7 @@ DYNAMIC: List[Tuple[int, int, Dict[str, str]]] = [
 PRESET_NAMES = list(PRESETS) + ["dynamic", "custom"]
 
 DEFAULT_COLORS: Dict[str, Any] = {
-    "preset": "oled-warm",
+    "preset": "shabbat",
     "background": None,
     "letter": None,
     "nikkud": None,
@@ -216,6 +216,168 @@ TENS_AND = {10: "וְעֶשֶׂר", 20: "וְעֶשְׂרִים", 30: "וָחֵ�
             40: "וְאַרְבָּעִים", 50: "וַחֲמִשִּׁים"}
 TENS_PLAIN = {20: "וְעֶשְׂרִים", 30: "וּשְׁלוֹשִׁים",
               40: "וְאַרְבָּעִים", 50: "וַחֲמִשִּׁים"}
+
+
+# --------------------------------------------------------------------------
+# Night dimming
+# --------------------------------------------------------------------------
+# The panel keeps its own luminance. Only the frame's pixel values are scaled, so
+# nothing here touches the device's brightness setting. Sunrise and sunset come
+# from Open-Meteo's daily block, cached per local date.
+STATE_DIR = os.path.expanduser("~/.cache/tuneshine-shaon-millim")
+SUN_STATE = os.path.join(STATE_DIR, "sun.json")
+LOCATION_TTL_S = 24 * 3600
+NIGHT_DIM_DEFAULT: Dict[str, Any] = {"enabled": True, "percent": 10}
+
+
+def load_sun_state() -> Dict[str, Any]:
+    try:
+        with open(SUN_STATE, encoding="utf-8") as fh:
+            state = json.load(fh)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sun_state(state: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = SUN_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=1)
+        os.replace(tmp, SUN_STATE)
+    except OSError as exc:
+        print("could not save sun times: %s" % exc, file=sys.stderr)
+
+
+def _coord(value: Any, limit: float) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if -limit <= number <= limit else None
+
+
+def locate(config: Dict[str, Any], state: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """Where the panel is, for sunrise and sunset.
+
+    Explicit latitude/longitude win. Otherwise `location: "auto"`, the default,
+    asks ipinfo once a day and caches the answer, so a once-a-minute cron does not
+    look it up every run. `location: "off"` disables night dimming entirely.
+    """
+    lat = _coord(config.get("latitude"), 90)
+    lon = _coord(config.get("longitude"), 180)
+    if lat is not None and lon is not None:
+        return lat, lon
+    if str(config.get("location") or "auto").lower() == "off":
+        return None
+    cached_lat, cached_lon = _coord(state.get("latitude"), 90), _coord(state.get("longitude"), 180)
+    if cached_lat is not None and cached_lon is not None:
+        if time.time() - float(state.get("located_at") or 0) < LOCATION_TTL_S:
+            return cached_lat, cached_lon
+    try:
+        resp = requests.get("https://ipinfo.io/json", timeout=8)
+        resp.raise_for_status()
+        payload = resp.json()
+        loc = str(payload.get("loc") or "")
+        lat = _coord(payload.get("latitude") or loc.split(",")[0], 90)
+        lon = _coord(payload.get("longitude") or (loc.split(",") + [""])[1], 180)
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        print("cannot locate the panel for night dimming: %s" % exc, file=sys.stderr)
+        return None
+    if lat is None or lon is None:
+        return None
+    state.update({"latitude": lat, "longitude": lon, "located_at": time.time()})
+    save_sun_state(state)
+    return lat, lon
+
+
+def fetch_sun(lat: float, lon: float) -> Optional[Dict[str, str]]:
+    """Sunrise and sunset for today, in the panel's local time."""
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": lat, "longitude": lon, "daily": "sunrise,sunset",
+                    "timezone": "auto", "forecast_days": 1},
+            timeout=12)
+        resp.raise_for_status()
+        daily = resp.json().get("daily") or {}
+        sunrise = (daily.get("sunrise") or [None])[0]
+        sunset = (daily.get("sunset") or [None])[0]
+        date = (daily.get("time") or [None])[0]
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        print("cannot fetch sunrise/sunset: %s" % exc, file=sys.stderr)
+        return None
+    if not sunrise or not sunset:
+        return None
+    return {"sunrise": sunrise, "sunset": sunset, "date": date}
+
+
+def sun_times(config: Dict[str, Any], now: Optional[datetime] = None) -> Optional[Dict[str, str]]:
+    """Today's sunrise and sunset, from the cache while that date is still today."""
+    now = now or datetime.now()
+    state = load_sun_state()
+    today = now.strftime("%Y-%m-%d")
+    if state.get("date") == today and state.get("sunrise") and state.get("sunset"):
+        return {"sunrise": state["sunrise"], "sunset": state["sunset"], "date": today}
+    pair = locate(config, state)
+    if pair is None:
+        return None
+    sun = fetch_sun(*pair)
+    if sun is None:
+        # Yesterday's times are a minute out at most. Using them beats dropping to
+        # full brightness because one request failed.
+        if state.get("sunrise") and state.get("sunset"):
+            return {"sunrise": state["sunrise"], "sunset": state["sunset"], "date": state.get("date")}
+        return None
+    state.update(sun)
+    save_sun_state(state)
+    return sun
+
+
+def night_brightness(config: Dict[str, Any], sun: Optional[Dict[str, str]],
+                     at: datetime) -> Tuple[int, bool]:
+    """Brightness percent for right now, and whether it is night.
+
+    100 by day, `night_dim.percent` between sunset and sunrise. Returns 100
+    whenever the schedule is off or the times are unknown, so a failed forecast
+    never leaves the panel stuck dim. Percent 0 gives a fully black frame.
+    """
+    schedule = {**NIGHT_DIM_DEFAULT, **(config.get("night_dim") or {})}
+    if not schedule.get("enabled") or not sun:
+        return 100, False
+    if not sun.get("sunrise") or not sun.get("sunset"):
+        return 100, False
+    try:
+        rise = datetime.fromisoformat(str(sun["sunrise"])).replace(tzinfo=None)
+        sett = datetime.fromisoformat(str(sun["sunset"])).replace(tzinfo=None)
+    except ValueError:
+        print("night_dim: unparsable sunrise/sunset %r %r" % (sun["sunrise"], sun["sunset"]),
+              file=sys.stderr)
+        return 100, False
+    moment = at.replace(tzinfo=None)
+    if not (moment >= sett or moment < rise):
+        return 100, False
+    try:
+        percent = int(round(float(schedule.get("percent", NIGHT_DIM_DEFAULT["percent"]))))
+    except (TypeError, ValueError):
+        return 100, False
+    return max(0, min(100, percent)), True
+
+
+def dim_frame(img: Image.Image, percent: int) -> Image.Image:
+    """Scale every pixel by `percent`. The device's own luminance is never touched.
+
+    This runs on the finished frame, never on the palette. `_line_tile` derives its
+    mask from an absolute luminance cutoff, so building the tiles from dimmed
+    colours drops whole lines: at 10% the period colour fell under the cutoff and
+    the frame came out empty. Dimming last keeps the glyph geometry independent of
+    brightness and leaves the sharpening decision to full precision.
+    """
+    if percent >= 100:
+        return img
+    factor = max(0, percent) / 100.0
+    return img.point(lambda v: int(v * factor))
 
 
 def strip_nikkud(text: str) -> str:
@@ -500,12 +662,17 @@ def _crisp(img: Image.Image, palette: "Palette") -> Image.Image:
     return img
 
 
-def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None):
+def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None,
+           brightness: int = 100):
     """Render one frame. Returns (image, info).
 
     info carries the diagnostics a caller needs to judge whether the phrase was
     comfortable at this size: the size chosen, the line count, the widest line,
     and whether anything overflowed.
+
+    `brightness` scales the palette before drawing, so antialias coverage and
+    crisp snapping both work from the dimmed colours rather than dimming a
+    finished frame after the fact.
     """
     opts = resolve_render(config)
     fonts = (config or {}).get("fonts") or {}
@@ -543,6 +710,7 @@ def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None):
 
     if not opts["antialias"]:
         img = _crisp(img, pal)
+    img = dim_frame(img, brightness)
 
     widest = max((t[0].width for t in tiles), default=0)
     longest = max((len(strip_nikkud(" ".join(t.text for t in line))) for line in lines), default=0)
@@ -555,6 +723,7 @@ def render(hour: int, minute: int, config: Optional[Dict[str, Any]] = None):
         "limit": MAX_W,
         "chars": longest,
         "fits": bool(fits and widest <= MAX_W),
+        "brightness": brightness,
     }
     return img, info
 
@@ -998,7 +1167,8 @@ def emit_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     for key, value in ((config or {}).get("colors") or {}).items():
         if key in colors and value is not None:
             colors[key] = value
-    return {"colors": colors, "render": opts}
+    night = {**NIGHT_DIM_DEFAULT, **((config or {}).get("night_dim") or {})}
+    return {"colors": colors, "render": opts, "night_dim": night}
 
 
 def main() -> int:
@@ -1022,6 +1192,9 @@ def main() -> int:
     ap.add_argument("--line-height", type=int, default=None,
                     help="line pitch for static (default: size + 4)")
     ap.add_argument("--gap", type=int, default=None, help="pixels between lines in fit mode")
+    ap.add_argument("--brightness", type=int, default=None, metavar="N",
+                    help="dim the frame to N percent (0-100); --push works this out itself "
+                         "from sunrise and sunset")
     ap.add_argument("--config", default=None, help="JSON config; its blocks win over flags")
     ap.add_argument("--out", default="frame.png", help="output PNG path")
     ap.add_argument("--scale", type=int, default=8)
@@ -1089,10 +1262,13 @@ def main() -> int:
         now = datetime.now(tz)
         hour, minute = now.hour, now.minute
         hhmm = "%02d:%02d" % (hour, minute)
-        img, info = render(hour, minute, config)
+        sun = sun_times(file_cfg, now)
+        brightness, is_night = night_brightness(file_cfg, sun, now)
+        img, info = render(hour, minute, config, brightness=brightness)
         spoken = strip_nikkud(" ".join(t.text for t in phrase(hour, minute)))
-        print("%s  %s · %dpx · %d lines  %s" % (hhmm, info["sizing"], info["size"],
-                                                info["lines"], spoken))
+        print("%s  %s · %dpx · %d lines  [%s %d%%]  %s" % (
+            hhmm, info["sizing"], info["size"], info["lines"],
+            "night" if is_night else "day", brightness, spoken))
         if not info["fits"]:
             print("warning: this phrase does not fit the panel at the chosen settings",
                   file=sys.stderr)
@@ -1108,7 +1284,8 @@ def main() -> int:
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         ap.error("--time must be within 00:00-23:59")
 
-    img, info = render(hour, minute, config)
+    brightness = 100 if args.brightness is None else max(0, min(100, args.brightness))
+    img, info = render(hour, minute, config, brightness=brightness)
     pal = colors_from_config(config, hour)
 
     if args.simulate:
